@@ -21,6 +21,8 @@ class Settings:
     db_path: str = os.getenv("AUDIT_DB_PATH", os.path.join(os.getcwd(), "audit.db"))
     # 写锁等待秒数（busy_timeout 毫秒数 = 该值 * 1000）
     db_timeout: int = _as_int("AUDIT_DB_TIMEOUT", 10)
+    # 核验包签名 RSA 密钥位数（RS256）；生产保持 2048，测试可调小加速
+    signing_key_bits: int = _as_int("AUDIT_SIGNING_KEY_BITS", 2048)
 
     @property
     def busy_timeout_ms(self) -> int:

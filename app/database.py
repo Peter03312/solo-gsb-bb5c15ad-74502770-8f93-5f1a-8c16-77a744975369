@@ -157,6 +157,24 @@ CREATE TABLE IF NOT EXISTS fault_periods (
 
 CREATE INDEX IF NOT EXISTS idx_fault_periods_window
     ON fault_periods(window_id, status, start_at, end_at);
+
+-- 核验包本地签名密钥：馆方在本地轮换签名密钥。
+-- 任意时刻至多一行 status='active'（新包用其私钥签名）；轮换只把旧行置为
+-- retired，历史公钥（及私钥）永久保留——旧核验包仍可凭其验签，重启后一致。
+-- 密钥全部落库（SQLite 文件/卷即密钥载体；私钥不经任何接口输出）。
+CREATE TABLE IF NOT EXISTS signing_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id TEXT NOT NULL UNIQUE,             -- SPKI DER 的 SHA-256 hex（随核验包发布）
+    status TEXT NOT NULL DEFAULT 'active',   -- active | retired
+    public_key_pem TEXT NOT NULL,            -- SubjectPublicKeyInfo（PUBLIC KEY）PEM
+    private_key_pem TEXT NOT NULL,           -- PKCS#1（RSA PRIVATE KEY）PEM；仅本地签名用
+    algorithm TEXT NOT NULL DEFAULT 'RS256', -- RSASSA-PKCS1-v1_5 + SHA-256
+    rotate_reason TEXT,                      -- 轮换/启用原因
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_signing_keys_status
+    ON signing_keys(status);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，

@@ -30,7 +30,15 @@
 跨窗边界两侧均超限连续累计，正常或未知含故障遮蔽切断累计；严格超限判
 不合格，否则有未知判待定，其余合格；重复/不存在、已撤销/非最新版、窗口
 不接续、温度范围不一致均明确拒绝且不出具部分结果；复核取同一已提交状态，
-不改证书或移交单）。
+不改证书或移交单）；
+馆员可向**馆外接收方出具证书核验包**（输入已签发证书标识，返回含证书标识、
+版本、结论、签发时间、不可变快照摘要、密钥标识与签名的可携带内容；
+RS256 签名覆盖包内除签名外的全部字段，原证书及快照不修改、不复制；
+接收方提交核验包时分别得到**签名是否可信、快照是否可信**，以及**该证书是否
+仍为所属窗口最新未撤销版本**——已撤销或被新版本替代会说明原因，**可信历史包
+不等于当前可用**；字段篡改、未知密钥、无对应证书或快照摘要不符均明确拒绝，
+核验不改变业务状态）；馆方可在**本地轮换签名密钥**（新包用新密钥，旧包凭
+保留的历史公钥仍可核验，密钥全部落库、重启后结果一致）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
@@ -352,6 +360,51 @@
   - 任一证书不存在 → **404**；
   - 任一证书已撤销，或不是其窗口最新签发版本（非当前可用证书）→ **409**。
 
+### 证书核验包（馆外可携带）与本地签名密钥轮换
+
+馆员需要把一张已签发证书交给**馆外接收方**自行核实时，
+`POST /api/v1/certificates/{id}/verification-package` 输入已签发证书标识，
+返回一份**可携带、可离线自证**的核验包：
+
+- **出具（只读）**：核验包含 `certificate_id`（证书标识）、`window_id`、
+  `version`（版本）、`verdict`/`verdict_label_zh`（结论）、`issued_at`（签发时间）、
+  `snapshot_digest`（**不可变快照摘要**：快照 canonical JSON 的 SHA-256 hex）、
+  `key_id`（签名密钥标识：公钥 SPKI DER 的 SHA-256 hex）、固定算法字段
+  （`alg=RS256`、`snapshot_digest_alg=sha256`、`package_type`、`package_version`、
+  `issued_by`）与 `signature`（Base64 编码签名）。
+  **RS256（RSASSA-PKCS1-v1_5 + SHA-256）签名覆盖包内除 `signature` 外的全部字段**
+  （以 canonical JSON：键排序、无多余空白、中文不转义重建报文）；出具**不修改、不复制原证书
+  及不可变快照，不落任何记录**，可重复调用（同密钥下结果一致）。证书不存在 → **404**。
+- **接收方核验（只读）**：`POST /api/v1/verification-packages/verify` 提交整包，
+  在同一读事务（同一已提交状态）内分别回答：
+  - **签名是否可信** `signature.trusted`：`key_id` 必须是馆方保留的当前或历史
+    密钥（**未知密钥 → 422**），且用该公钥验签通过（**任一字段被篡改/签名错误
+    → 422**）；
+  - **快照是否可信** `snapshot.trusted`：包内 `certificate_id` 对应的证书必须
+    存在（**无对应证书 → 404**），且库中该证**现有不可变快照的摘要与包内摘要
+    逐字节一致**（**摘要不符 → 422**）；同时比对包内版本/结论/签发时间等字段
+    与现存证书一致（张冠李戴 → 422）；
+  - **当前是否可用** `certificate.currently_usable` / `trusted` 与
+    `currently_usable` 两个结论相互独立：该证书是否**仍为所属窗口最新签发且未
+    撤销版本**。已撤销（`status=revoked`，附撤销原因/时间）或被新版本替代
+    （`status=superseded`，附最新版本号）都给出明确 `reason_zh`——
+    **可信历史包不等于当前可用**；当前仍可用时为 `status=current`
+    （一张证书既已撤销又非最新版时按已撤销说明）。
+  - 核验为**只读**：通过与拒绝都不改变证书、撤销、快照、密钥等任何业务状态；
+    拒绝响应只含 `detail`，不出具核验结论。
+- **本地密钥轮换**：`POST /api/v1/signing-keys/rotate`（可带非空原因，亦可空
+  `{}`）在**本地**生成新 RSA-2048 密钥并置为当前签名密钥：此后**新出具的核验包
+  使用新密钥**；旧密钥仅置 `retired`，**公钥与私钥永久保留在库**——**旧核验包仍可
+  凭历史公钥核验**。`GET /api/v1/signing-keys` 可取全部公钥（SubjectPublicKeyInfo
+  PEM），接收方也可用 OpenSSL 离线验签：
+  `openssl dgst -sha256 -verify pub.pem -signature sig.bin payload.bin`
+  （payload 为去掉 `signature` 字段后的 canonical JSON；见示例脚本 19.7）。
+  **私钥不经任何接口输出**；密钥全部随 SQLite 落库（卷持久化），**服务重启后
+  不重新生成、核验结果一致**。首次出具核验包或首次轮换时若库内尚无密钥则在本地
+  生成首把（密钥位数可用 `AUDIT_SIGNING_KEY_BITS` 调整，生产保持默认 2048）。
+- **沿用既有约定**：证书、撤销与当前可用证书接口的响应结构与 404/409/422 语义
+  不变；核验包与签名密钥均为**新增端点 + 新增表**，不改动任何既有响应字段。
+
 ---
 
 ## 2. 启动
@@ -388,6 +441,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `AUDIT_DB_PATH` | `./audit.db` | SQLite 数据库文件路径；Compose 中为 `/data/audit.db` |
 | `AUDIT_DB_TIMEOUT` | `10` | 写锁等待秒数（对应 SQLite `busy_timeout` 毫秒数 ×1000） |
+| `AUDIT_SIGNING_KEY_BITS` | `2048` | 核验包签名 RSA 密钥位数（RS256；仅建议测试时调小） |
 | `LOG_LEVEL` | `info` | 日志级别（透传给运行环境） |
 
 ### 地址与端口
@@ -520,6 +574,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/v1/windows/{id}/certificates/issue` | 签发（可带 `{"note":"..."}`，也可空 body）；版本递增，撤销后再签发沿用递增版本号 |
 | `GET` | `/api/v1/windows/{id}/certificates` | 该窗口全部证书版本（按版本升序），含每证 `revoked`/`revocation` 撤销标示 |
 | `POST` | `/api/v1/certificates/{id}/revocation` | 撤销已签发证书（body `{"reason":"非空原因"}`）：只改有效性，版本/结论/快照不变；同因重放幂等返回原记录，异因 409，空因 422，不存在 404；响应含撤销后窗口当前可用证书 |
+| `POST` | `/api/v1/certificates/{id}/verification-package` | 向馆外接收方出具证书核验包（只读、不落记录）：返回含证书标识/版本/结论/签发时间/不可变快照摘要/密钥标识/签名的可携带内容；证书不存在 404 |
+| `POST` | `/api/v1/verification-packages/verify` | 接收方提交核验包核验（只读）：分别给出签名是否可信、快照是否可信，以及该证书是否仍为所属窗口最新未撤销版本；篡改/未知密钥/摘要不符 422，无对应证书 404 |
 | `GET` | `/api/v1/certificates/{id}` | 按证书主键获取（不存在 404），`snapshot` 为签发时不可变快照，`revoked`/`revocation` 标示撤销状态 |
 | `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告（证书即使已撤销也可比对；引用中带撤销标示，比对内容只依快照） |
 
@@ -571,6 +627,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/cross-window-reviews` | 跨审定窗口连续温度暴露只读复核：按时间排列的至少两张**当前可用证书**（最新签发且未撤销）+ 正数全程连续超限上限；只从各证不可变快照还原半开区段（不用当前读数/规则），跨窗边界两侧均超限连续累计、正常/未知（含故障遮蔽）切断累计；输出逐段状态与来源证书、全程最长连续超限、未知总时长与结论。重复/不足两张/非正上限/顺序错误/窗口不接续/温度范围不一致 422（不出部分结果），证书不存在 404，已撤销或非最新版 409；只读，取同一已提交状态且不改证书/移交单 |
+
+### 本地签名密钥（核验包）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/signing-keys/rotate` | 馆员在本地轮换核验包签名密钥（body 可带 `{"reason":"..."}`，也可空 `{}`）：生成新 RSA-2048 密钥并置为当前，旧密钥置 retired 但公钥永久保留；返回新公钥 PEM 与被退役旧密钥标识 |
+| `GET` | `/api/v1/signing-keys` | 列出全部本地签名密钥（当前 active + 历史 retired）及各自公钥 PEM（供接收方验签）；**私钥不经任何接口输出** |
 
 复核请求与响应：
 
@@ -768,7 +831,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   作废或查询修订历史时读数从未存在；
   **仪器故障时段登记时窗口不存在、撤回时窗口不存在或故障标识在该窗口从未登记（未知标识）**；
   **移交单：申请放行时任一窗口不存在；按单号查询时移交单不存在**；
-  **跨窗复核：任一证书不存在**
+  **跨窗复核：任一证书不存在；核验包：接收方提交时包内证书标识在馆方库中无对应证书（有效签名但引用对象不存在）；对不存在的证书出具核验包**
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
   以不高于作废修订号的提交尝试复活读数；
@@ -791,7 +854,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   **移交单：窗口标识列表为空、列表内标识重复、移交单号为空或只含空白**；
   **跨窗复核：证书不足 2 张、证书标识重复、全程上限非正数或非有限值、
   输入未按窗口时间先后排列、窗口不接续（有缝隙或重叠）、各窗口允许
-  温度上下限不一致（响应只含 `detail`，不出具分段/时长等部分结果）**
+  温度上下限不一致（响应只含 `detail`，不出具分段/时长等部分结果）**；
+  **核验包：未知签名密钥、签名验签失败（任一字段被篡改或签名错误）、
+  包内不可变快照摘要与现存快照不符、包内证书字段与现存证书不一致、
+  额外/缺失字段、非 hex 摘要或密钥标识、签名非合法 Base64、固定取值
+  字段（包类型/版本/算法）被改（响应只含 `detail`，不出具核验结论）**
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
 > 不会出现“批内前几项已生效、后几项失败”的部分写入。跨窗复核为只读，
@@ -804,10 +871,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核 → 证书核验包出具/核验与本地签名密钥轮换）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核、证书核验包出具/核验与签名密钥轮换）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -994,6 +1061,52 @@ curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
 # 复核只读：不改证书/读数/规则/故障登记/移交单，可随时凭同一组证书重复调用。
 ```
 
+证书核验包与本地签名密钥轮换最小示例（承接一张已签发证书 `$CID`）：
+
+```bash
+# 馆员出具核验包（只读，不改原证书与快照；首次调用时本地自动生成签名密钥）
+curl -sS -X POST http://localhost:8000/api/v1/certificates/$CID/verification-package > pkg.json
+# pkg.json：{"effect":"issued","package":{"certificate_id":...,"version":...,"verdict":"pass",
+#   "issued_at":"...","snapshot_digest":"<64位hex>","key_id":"<64位hex>","alg":"RS256",
+#   "signature":"<Base64 签名，覆盖除 signature 外全部字段>", ...}}
+python3 -c 'import json;print(json.dumps(json.load(open("pkg.json"))["package"]))' > package.json
+
+# 接收方提交核验包：签名可信 + 快照可信 + 当前是否最新未撤销版本
+curl -sS -X POST http://localhost:8000/api/v1/verification-packages/verify \
+  -H 'Content-Type: application/json' -d @package.json
+# -> {"trusted":true,"currently_usable":true,
+#     "signature":{"trusted":true,"key_id":"...","alg":"RS256",...},
+#     "snapshot":{"trusted":true,"expected_digest":"...","alg":"sha256",...},
+#     "certificate":{"status":"current","status_label_zh":"当前可用","revoked":false,
+#                    "is_latest_version":true,"reason_zh":"...",...},
+#     "conclusion_zh":"核验通过：……当前可用。"}
+#
+# 该证书随后被撤销 -> 再核验同一包：trusted 仍为 true，但 currently_usable=false、
+# certificate.status="revoked"（附撤销原因）；同窗口再签发新版本 -> 旧包 status="superseded"。
+# 可信历史包不等于当前可用。拒绝：改任一字段/伪造签名 -> 422（签名不可信）；
+# 未知 key_id -> 422；快照摘要不符 -> 422；无对应证书 -> 404；核验不改任何业务状态。
+
+# 本地轮换签名密钥：新包用新密钥；旧密钥置 retired 但公钥保留，旧包仍可验
+curl -sS -X POST http://localhost:8000/api/v1/signing-keys/rotate \
+  -H 'Content-Type: application/json' -d '{"reason":"年度密钥轮换"}'
+# -> {"effect":"rotated","key":{"key_id":"...","status":"active",
+#     "public_key_pem":"-----BEGIN PUBLIC KEY-----\n...","algorithm":"RS256",...},
+#     "retired_key_ids":["<旧密钥标识>"]}
+curl -sS http://localhost:8000/api/v1/signing-keys   # 全部公钥（active + retired；不含私钥）
+
+# 可选：用 OpenSSL 离线验签（payload = 去掉 signature 后的 canonical JSON）
+python3 - <<'PY'
+import base64, json, subprocess
+p = json.load(open("package.json"))
+sig = base64.b64decode(p.pop("signature"))
+open("payload.bin","wb").write(json.dumps(p, sort_keys=True, ensure_ascii=False,
+                                          separators=(",", ":")).encode())
+open("sig.bin","wb").write(sig)
+print(subprocess.run(["openssl","dgst","-sha256","-verify","pub.pem",
+                      "-signature","sig.bin","payload.bin"], capture_output=True, text=True).stdout)
+PY
+```
+
 ---
 
 ## 5. 测试
@@ -1056,19 +1169,32 @@ PYTHONPATH=. python -m pytest tests/ -q
   间隔未知/故障遮蔽未知待定/有未知仍 fail；只读不改证书且只依快照；
   重复标识/不足两张/非正与非有限上限 422、不存在 404、已撤销或非最新版
   409、窗口不接续/温度范围不一致/未按时间排列 422 且拒绝不含部分结果）。
+- `tests/test_signing.py`：核验包签名原语单元测试（RSA 密钥结构、
+  PKCS#1/SPKI PEM 往返、RS256 签名/验签与各类篡改拒绝、canonical JSON
+  稳定性与快照摘要、密钥标识；环境有 OpenSSL 时验证 2048 位密钥双向互通）。
+- `tests/test_verification_package_api.py`：证书核验包 HTTP 集成测试
+  （出具字段与确定性签名、只读不改证书快照、证书不存在 404；核验可信且
+  当前可用、撤销后可信但 revoked、新版本后旧包 superseded、撤销最新版不
+  退回旧版、撤销旧版不影响当前；字段/签名篡改、未知密钥、快照摘要不符、
+  包内证书字段不一致、额外字段、非法 hex/Base64/固定值字段均 422，有效
+  签名但无对应证书 404；核验只读不改状态；轮换后新包用新密钥且旧包凭
+  retired 历史公钥仍可验、密钥列表不含私钥、多次轮换全部历史包可验、
+  重启后密钥与核验结果一致）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表/仪器故障时段表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表/仪器故障时段表/核验包本地签名密钥表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
+  signing.py       # 核验包签名原语（仅标准库；RSASSA-PKCS1-v1_5+SHA-256、RSA 密钥生成、PKCS#1/SPKI PEM 与 DER、canonical JSON、快照摘要）
   evaluation.py    # 核心审定算法（纯函数；含故障时段并集与遮蔽）
   cross_window.py  # 跨审定窗口连续温度暴露复核（纯函数；从各证不可变快照还原半开区段、接续/温度口径校验、跨边界超限累计与结论）
   report.py        # 修订影响报告（规则前后值、快照比对、故障时段差异、含故障遮蔽的时间线对齐，纯函数）
   models.py        # 结论枚举/常量（含移交单有效状态、仪器故障状态与未知来源）
-  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段、跨窗复核）
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段、跨窗复核、证书核验包与签名密钥轮换）
   services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、仪器故障时段（登记/撤回）、审定、签发、证书撤销、修订影响报告、移交放行单、跨窗复核（当前可用证书核对）业务逻辑
+  verification_packages.py  # 证书核验包：本地签名密钥（轮换/历史公钥保留/落库重启一致）、出具可携带包（只读）与接收方核验（签名+快照可信、当前可用性，只读）
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh

@@ -1,11 +1,15 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+import base64
 import math
+import re
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .signing import DIGEST_ALG_SHA256, SIGNATURE_ALG
 
 
 def _require_aware(dt: datetime) -> datetime:
@@ -751,6 +755,182 @@ class CrossWindowReviewOut(BaseModel):
     verdict: str = Field(..., description="fail | pending | pass")
     verdict_label_zh: str
     conclusion_zh: str
+
+
+# ------------------------------------------------------------ 证书核验包
+
+# 核验包为可携带自证内容：下列字段除 signature 外全部纳入 RS256 签名。
+# 不允许额外字段（extra=forbid）：新增/未知字段在接收方提交时明确拒绝。
+PACKAGE_TYPE = "certificate-verification-package"
+PACKAGE_VERSION = 1
+
+
+class VerificationPackage(BaseModel):
+    """馆员向馆外接收方出具的可携带证书核验包。
+
+    - 含证书标识、版本、结论、签发时间、不可变快照摘要、密钥标识与签名；
+    - 签名（RS256）覆盖除 signature 外的全部字段（canonical JSON），
+      原证书及快照不修改、不复制；
+    - 接收方提交本包核验：签名/快照不可信、未知密钥、无对应证书、快照摘要
+      不符均明确拒绝；通过后另行回答该证书当前是否仍为所属窗口最新未撤销版本。
+    """
+
+    package_type: str = Field(
+        PACKAGE_TYPE, description="固定为 certificate-verification-package，防误用")
+    package_version: int = Field(PACKAGE_VERSION, description="核验包格式版本（当前为 1）")
+    certificate_id: int = Field(..., description="已签发证书标识（主键）")
+    window_id: int = Field(..., description="证书所属审定窗口标识")
+    version: int = Field(..., description="证书签发版本号")
+    verdict: str = Field(..., description="证书签发时固化的结论（pass/pending/fail）")
+    verdict_label_zh: str = Field(..., description="结论中文标签（合格/待定/不合格）")
+    issued_at: str = Field(..., description="证书签发时间（UTC）")
+    snapshot_digest: str = Field(
+        ..., min_length=64, max_length=64,
+        description="不可变快照摘要：快照 canonical JSON 的 SHA-256（hex，64 位）")
+    snapshot_digest_alg: str = Field(DIGEST_ALG_SHA256, description="固定为 sha256")
+    key_id: str = Field(
+        ..., min_length=64, max_length=64,
+        description="签名密钥标识：公钥 SPKI DER 的 SHA-256（hex，64 位）")
+    alg: str = Field(SIGNATURE_ALG, description="固定为 RS256（RSASSA-PKCS1-v1_5 + SHA-256）")
+    issued_by: str = Field(
+        ..., description="出具方标识（馆名；来自服务标题/环境，默认 museum-audit-service）")
+    signature: str = Field(
+        ..., description="Base64 标准编码的 RS256 签名；覆盖除本字段外全部字段")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("package_type")
+    @classmethod
+    def _type_fixed(cls, v: str) -> str:
+        if v != PACKAGE_TYPE:
+            raise ValueError(f"核验包类型必须为 {PACKAGE_TYPE}")
+        return v
+
+    @field_validator("package_version")
+    @classmethod
+    def _version_fixed(cls, v: int) -> int:
+        if v != PACKAGE_VERSION:
+            raise ValueError(f"核验包版本必须为 {PACKAGE_VERSION}")
+        return v
+
+    @field_validator("alg")
+    @classmethod
+    def _alg_fixed(cls, v: str) -> str:
+        if v != SIGNATURE_ALG:
+            raise ValueError(f"核验包签名算法必须为 {SIGNATURE_ALG}")
+        return v
+
+    @field_validator("snapshot_digest_alg")
+    @classmethod
+    def _digest_alg_fixed(cls, v: str) -> str:
+        if v != DIGEST_ALG_SHA256:
+            raise ValueError(f"快照摘要算法必须为 {DIGEST_ALG_SHA256}")
+        return v
+
+    @field_validator("snapshot_digest", "key_id")
+    @classmethod
+    def _hex64(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError("必须为 64 位小写十六进制 SHA-256 摘要")
+        return v
+
+    @field_validator("signature")
+    @classmethod
+    def _b64_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("签名不能为空")
+        try:
+            base64.b64decode(v, validate=True)
+        except Exception as exc:
+            raise ValueError("签名必须是合法的 Base64 标准编码") from exc
+        return v
+
+
+class VerificationPackageResponse(BaseModel):
+    effect: str = Field("issued", description="固定为 issued（只读出具，不落记录，可重复调用）")
+    package: VerificationPackage
+
+
+class PackageSignatureTrust(BaseModel):
+    trusted: bool = Field(..., description="签名是否可信（已知密钥且验签通过）")
+    key_id: str
+    alg: str
+    reason_zh: Optional[str] = Field(None, description="不可信时的明确原因（中文）")
+
+
+class PackageSnapshotTrust(BaseModel):
+    trusted: bool = Field(..., description="快照是否可信（库中存在对应证书，其不可变快照摘要与包内一致）")
+    expected_digest: Optional[str] = Field(None, description="库中现有不可变快照实际摘要（便于比对）")
+    alg: str
+    reason_zh: Optional[str] = Field(None, description="不可信时的明确原因（中文）")
+
+
+class PackageCertificateStatus(BaseModel):
+    certificate_id: int
+    window_id: int
+    version: int = Field(..., description="包内证书版本")
+    verdict: str
+    verdict_label_zh: str
+    revoked: bool = Field(..., description="该证书当前是否已撤销")
+    revocation: Optional[RevocationInfoOut] = Field(
+        None, description="撤销信息（原因与撤销时间）；未撤销为 null")
+    is_latest_version: bool = Field(..., description="该证书是否仍为所属窗口最新签发版本")
+    currently_usable: bool = Field(
+        ..., description="是否当前可用：最新签发版本且未撤销（可信历史包不等于当前可用）")
+    status: str = Field(..., description="current | revoked | superseded")
+    status_label_zh: str = Field(..., description="当前可用 | 已撤销 | 已被新版本替代")
+    reason_zh: str = Field(..., description="当前状态的中文说明（撤销原因/被替代等）")
+    latest_version: Optional[int] = Field(
+        None, description="所属窗口当前最新签发版本号（无证书为 null）")
+
+
+class VerificationResultOut(BaseModel):
+    """接收方提交核验包后的核验结论（只读，不改变任何业务状态）。"""
+
+    trusted: bool = Field(
+        ..., description="签名可信且快照可信（包内证书内容自证成立）")
+    currently_usable: bool = Field(
+        ..., description="该证书是否仍为所属窗口最新未撤销版本（与可信历史无关）")
+    conclusion_zh: str = Field(..., description="一段中文核验结论（可信/当前可用与否及原因）")
+    signature: PackageSignatureTrust
+    snapshot: PackageSnapshotTrust
+    certificate: PackageCertificateStatus
+
+
+# ------------------------------------------------------------ 本地签名密钥轮换
+
+class SigningKeyRotateSubmit(BaseModel):
+    """馆员在本地轮换核验包签名密钥（可选非空原因）。
+
+    生成新的 RSA 密钥对并置为当前签名密钥（新出具的核验包使用新密钥），
+    旧密钥置为 retired 但公钥永久保留：历史核验包仍可凭旧公钥验签。
+    """
+
+    reason: Optional[str] = Field(
+        None, max_length=500, description="轮换原因（可省略；若提供不能只含空白）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank_if_given(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("轮换原因不能只含空白字符（可省略）")
+        return v
+
+
+class SigningKeyOut(BaseModel):
+    key_id: str = Field(..., description="密钥标识（SPKI DER 的 SHA-256 hex）")
+    status: str = Field(..., description="active | retired（retired 旧公钥仍可验历史包）")
+    algorithm: str
+    public_key_pem: str = Field(..., description="SubjectPublicKeyInfo（PUBLIC KEY）PEM，供接收方验签")
+    rotate_reason: Optional[str] = Field(None, description="启用/轮换原因")
+    created_at: str = Field(..., description="密钥生成时间（UTC）")
+
+
+class SigningKeyRotateResponse(BaseModel):
+    effect: str = Field("rotated", description="rotated | initialized（库内无密钥时首次启动/轮换为 initialized）")
+    key: SigningKeyOut
+    retired_key_ids: list[str] = Field(
+        ..., description="本次被退役的旧当前密钥标识（公钥保留，历史包仍可验）")
 
 
 class ErrorBody(BaseModel):

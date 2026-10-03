@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
-from . import services
+from . import services, verification_packages
 from .database import connect, get_conn, init_db, read_transaction, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
@@ -38,6 +38,12 @@ from .schemas import (
     RuleRevisionOut,
     RuleRevisionResponse,
     RuleRevisionSubmit,
+    SigningKeyOut,
+    SigningKeyRotateResponse,
+    SigningKeyRotateSubmit,
+    VerificationPackageResponse,
+    VerificationPackage,
+    VerificationResultOut,
     WindowCreate,
     WindowOut,
 )
@@ -45,7 +51,9 @@ from .schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时幂等建表并初始化 WAL
+    # 启动时幂等建表并初始化 WAL。
+    # 核验包签名密钥不在启动时生成（避免无谓密钥膨胀）：首次出具核验包或
+    # 馆员显式轮换时在本地生成并落库；此后重启复用同一把，轮换不影响旧包。
     conn = connect()
     try:
         init_db(conn)
@@ -56,7 +64,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -81,6 +89,13 @@ app = FastAPI(
         "证书、全程最长连续超限时长、未知总时长与结论；重复/不存在证书、"
         "已撤销或非最新版证书、窗口不接续、温度范围不一致均明确拒绝且不出"
         "部分结果，复核取同一已提交状态且不改证书或移交单。"
+        "馆员可向馆外接收方出具证书核验包（含证书标识/版本/结论/签发时间/"
+        "不可变快照摘要/密钥标识与签名，签名覆盖除签名外全部字段，原证书与"
+        "快照不改）；接收方提交核验包分别得到签名与快照是否可信、该证书是否"
+        "仍为所属窗口最新未撤销版本（已撤销或被新版本替代说明原因，可信历史包"
+        "不等于当前可用）。馆方可在本地轮换签名密钥：新包用新密钥，旧包凭保留"
+        "的历史公钥仍可核验，重启后结果一致；字段篡改、未知密钥、无对应证书或"
+        "快照摘要不符均明确拒绝，核验不改业务状态。"
     ),
     lifespan=lifespan,
 )
@@ -484,6 +499,85 @@ def get_certificate(
     certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
 ) -> dict[str, Any]:
     return services.get_certificate(conn, certificate_id)
+
+
+# ------------------------------------------------------------ 证书核验包
+
+@app.post(
+    "/api/v1/certificates/{certificate_id}/verification-package",
+    response_model=VerificationPackageResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["verification-packages"],
+)
+def issue_verification_package(
+    certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """馆员向馆外接收方出具证书核验包（只读出具，不落记录，可重复调用）。
+
+    输入已签发证书标识，返回含证书标识、版本、结论、签发时间、不可变快照
+    摘要、密钥标识与签名的可携带内容；RS256 签名覆盖包内除 signature 外的
+    全部字段，原证书及不可变快照不修改、不复制。证书不存在 -> 404。
+    库内尚无签名密钥时在本地自动生成首把（亦可经签名密钥接口显式轮换）。
+    """
+    return verification_packages.issue_verification_package(conn, certificate_id)
+
+
+@app.post(
+    "/api/v1/verification-packages/verify",
+    response_model=VerificationResultOut,
+    tags=["verification-packages"],
+)
+def verify_verification_package(
+    payload: VerificationPackage, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """接收方提交核验包核验（只读，不改变任何业务状态）。
+
+    - 未知签名密钥、验签失败（字段篡改/签名不匹配）、快照摘要不符、
+      包内证书字段与现存证书不一致 -> 422 明确拒绝；
+    - 无对应证书 -> 404；
+    - 全部通过则分别给出签名是否可信、快照是否可信，以及该证书当前是否仍为
+      所属窗口最新未撤销版本：已撤销或被新版本替代会说明原因
+      （可信历史包不等于当前可用）。多次核对在同一读事务内取同一已提交状态。
+    """
+    with read_transaction(conn):
+        return verification_packages.verify_verification_package(conn, payload.model_dump())
+
+
+# ------------------------------------------------------------ 本地签名密钥轮换
+
+@app.post(
+    "/api/v1/signing-keys/rotate",
+    response_model=SigningKeyRotateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["signing-keys"],
+)
+def rotate_signing_key(
+    payload: SigningKeyRotateSubmit, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """馆员在本地轮换核验包签名密钥（body 可带非空原因，亦可空 `{}`）。
+
+    生成新 RSA 密钥对并置为当前签名密钥：此后新出具的核验包用新密钥签名；
+    旧密钥置为 retired 但公钥（与私钥）永久保留，旧核验包仍可凭历史公钥
+    验签（密钥全部落库，重启后结果一致）。返回新公钥（PEM）与被退役的
+    旧密钥标识列表。
+    """
+    with write_transaction(conn):
+        effect, key_info, retired_ids = verification_packages.rotate_signing_key(
+            conn, payload.reason)
+        return {"effect": effect, "key": key_info, "retired_key_ids": retired_ids}
+
+
+@app.get("/api/v1/signing-keys", response_model=list[SigningKeyOut],
+         tags=["signing-keys"])
+def list_signing_keys(
+    conn: sqlite3.Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """列出全部本地签名密钥（当前 active + 历史 retired），含各自公钥 PEM。
+
+    接收方可据此取得馆方公钥（SubjectPublicKeyInfo PEM）离线验签：
+    历史公钥长期保留，轮换后旧包仍可验。私钥不经任何接口输出。
+    """
+    return verification_packages.list_signing_keys(conn)
 
 
 # ---------------------------------------------------------------- 跨窗连续温度暴露复核

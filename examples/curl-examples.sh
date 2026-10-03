@@ -478,3 +478,100 @@ api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"m
 # 撤销后窗2重签 v2 恢复当前可用；旧版 CC2 仍为已撤销不可用
 api POST "/api/v1/windows/$CW2/certificates/issue" '{"note":"撤销后重签 v2"}' >/dev/null
 api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":500}" || true
+
+echo "== 19. 证书核验包（馆外可携带）与本地签名密钥轮换（单独建窗口演示）=="
+PW=$(api POST /api/v1/windows '{
+  "name": "展柜H-核验包",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 120
+}')
+PID=$(echo "$PW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for m in 0 1 2 3 4 5; do
+  api POST "/api/v1/windows/$PID/readings" \
+    "{\"reading_id\":\"r-$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+done
+PC1=$(api POST "/api/v1/windows/$PID/certificates/issue" '{"note":"核验包首签"}')
+PCID=$(echo "$PC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 19.1 馆员出具核验包：含证书标识/版本/结论/签发时间/不可变快照摘要/密钥标识/签名（只读，不改原证书与快照）--"
+PKG1=$(api POST "/api/v1/certificates/$PCID/verification-package")
+echo "$PKG1" | python3 -m json.tool
+echo "$PKG1" | python3 -c "import sys,json;p=json.load(sys.stdin)['package'];print('快照摘要:',p['snapshot_digest']);print('密钥标识:',p['key_id'])"
+
+echo "-- 19.2 接收方提交核验包：签名可信 + 快照可信 + 当前为最新未撤销版本（当前可用）--"
+echo "$PKG1" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['package']))" > /tmp/pkg1.json
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg1.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted:',d['trusted'],'currently_usable:',d['currently_usable']);print('签名可信:',d['signature']['trusted'],'快照可信:',d['snapshot']['trusted']);print('证书状态:',d['certificate']['status'],d['certificate']['status_label_zh']);print(d['conclusion_zh'])"
+
+echo "-- 19.3 字段篡改 -> 422 签名不可信（version 改成 9）--"
+python3 -c "import json;p=json.load(open('/tmp/pkg1.json'));p['version']=9;print(json.dumps(p))" > /tmp/pkg_bad.json
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg_bad.json)" || true
+echo "-- 未知密钥 -> 422 --"
+python3 -c "import json;p=json.load(open('/tmp/pkg1.json'));p['key_id']='ab'*32;print(json.dumps(p))" > /tmp/pkg_unknown.json
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg_unknown.json)" || true
+echo "-- 快照摘要不符（伪造为另一摘要）-> 422 --"
+python3 -c "import json;p=json.load(open('/tmp/pkg1.json'));p['snapshot_digest']='cd'*32;print(json.dumps(p))" > /tmp/pkg_digest.json
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg_digest.json)" || true
+echo "-- 无对应证书（证书标识改 99999）-> 包内字段被改，验签先失败 422 --"
+python3 -c "import json;p=json.load(open('/tmp/pkg1.json'));p['certificate_id']=99999;print(json.dumps(p))" > /tmp/pkg_nocert.json
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg_nocert.json)" || true
+echo "-- 对不存在的证书出具核验包 -> 404 --"
+api POST /api/v1/certificates/99999/verification-package || true
+
+echo "-- 19.4 撤销后再核验：包仍可信，但不是当前可用（可信历史包不等于当前可用；说明原因）--"
+api POST "/api/v1/certificates/$PCID/revocation" '{"reason":"核验包演示：签发依据有误"}' >/dev/null
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg1.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted:',d['trusted'],'currently_usable:',d['currently_usable'],'状态:',d['certificate']['status']);print(d['certificate']['reason_zh'])"
+
+echo "-- 19.5 再次签发 v2 并出具新包：旧包为 superseded（可信但被新版本替代），新包当前可用 --"
+api POST "/api/v1/windows/$PID/certificates/issue" '{"note":"重签 v2"}' >/dev/null
+PC2=$(api GET "/api/v1/windows/$PID/certificates/current")
+PCID2=$(echo "$PC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+PKG2=$(api POST "/api/v1/certificates/$PCID2/verification-package")
+echo "$PKG2" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['package']))" > /tmp/pkg2.json
+echo -n "旧包（v1）："; api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg1.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted=',d['trusted'],'usable=',d['currently_usable'],'状态=',d['certificate']['status'])"
+echo -n "新包（v2）："; api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg2.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted=',d['trusted'],'usable=',d['currently_usable'],'状态=',d['certificate']['status'])"
+
+echo "-- 19.6 本地轮换签名密钥：新包用新密钥；旧包凭保留的历史公钥仍可核验 --"
+ROT=$(api POST /api/v1/signing-keys/rotate '{"reason":"年度密钥轮换"}')
+echo "$ROT" | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'退役旧密钥:',d['retired_key_ids']);print('新密钥:',d['key']['key_id'],'状态:',d['key']['status'])"
+NEWKID=$(echo "$ROT" | python3 -c "import sys,json;print(json.load(sys.stdin)['key']['key_id'])")
+PKG3=$(api POST "/api/v1/certificates/$PCID2/verification-package")
+echo "$PKG3" | python3 -c "import sys,json;p=json.load(sys.stdin)['package'];assert p['key_id']=='$NEWKID';print('轮换后新包使用新密钥:',p['key_id'])"
+echo "$PKG3" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['package']))" > /tmp/pkg3.json
+echo -n "轮换前旧包（/tmp/pkg1.json）仍可验："
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg1.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted=',d['signature']['trusted'],'key=',d['signature']['key_id'][:16]+'...')"
+echo -n "轮换后新包可验："
+api POST /api/v1/verification-packages/verify "$(cat /tmp/pkg3.json)" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('trusted=',d['trusted'],'usable=',d['currently_usable'])"
+echo "全部签名密钥（当前 active + 历史 retired，均只含公钥 PEM，不含私钥）："
+api GET /api/v1/signing-keys \
+  | python3 -c "import sys,json;[print(k['status'],k['key_id'][:16]+'...','公钥首行:',k['public_key_pem'].splitlines()[0]) for k in json.load(sys.stdin)]"
+
+echo "-- 19.7 离线验签（可选）：导出当前公钥，用 OpenSSL 核验包内签名覆盖除 signature 外全部字段 --"
+if command -v openssl >/dev/null 2>&1; then
+  api GET /api/v1/signing-keys \
+    | python3 -c "import sys,json;keys=json.load(sys.stdin);print(next(k['public_key_pem'] for k in keys if k['key_id']=='$NEWKID'))" > /tmp/museum-pub.pem
+  python3 - <<'PY'
+import base64, json, subprocess
+pkg = json.load(open('/tmp/pkg3.json'))
+sig = base64.b64decode(pkg.pop('signature'))
+# 与服务端一致的规范报文：键排序、无空白（canonical JSON）
+payload = json.dumps(pkg, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+open('/tmp/pkg3.payload', 'wb').write(payload)
+open('/tmp/pkg3.sig', 'wb').write(sig)
+r = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', '/tmp/museum-pub.pem',
+                    '-signature', '/tmp/pkg3.sig', '/tmp/pkg3.payload'],
+                   capture_output=True, text=True)
+print('OpenSSL 离线验签:', r.stdout.strip() or r.stderr.strip())
+PY
+else
+  echo "（环境无 openssl，跳过离线验签演示）"
+fi
