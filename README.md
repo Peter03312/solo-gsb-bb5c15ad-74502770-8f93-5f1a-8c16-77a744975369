@@ -30,9 +30,17 @@
 跨窗边界两侧均超限连续累计，正常或未知含故障遮蔽切断累计；严格超限判
 不合格，否则有未知判待定，其余合格；重复/不存在、已撤销/非最新版、窗口
 不接续、温度范围不一致均明确拒绝且不出具部分结果；复核取同一已提交状态，
-不改证书或移交单）。
+不改证书或移交单）；
+馆员可向**馆外接收方出具证书核验包**（输入已签发证书标识，返回含证书
+标识、版本、结论、签发时间、不可变快照 SHA-256 摘要、密钥标识与
+**Ed25519 签名**的可携带内容；签名覆盖包内除签名外全部字段，原证书及
+快照不改），接收方提交核验包时**分别得到签名、快照是否可信，以及该证书
+是否仍为所属窗口最新未撤销版本**（已撤销或被新版本替代须说明原因，
+**可信历史包不等于当前可用**）；签名密钥可在**本地轮换**（新包用新密钥，
+旧包仍可凭保留的历史公钥核验，重启后结果一致），字段篡改、未知密钥、
+无对应证书或快照摘要不符均明确拒绝，核验不改变业务状态。
 
-- 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
+- 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2 · Ed25519（cryptography）
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
 
 ---
@@ -352,6 +360,89 @@
   - 任一证书不存在 → **404**；
   - 任一证书已撤销，或不是其窗口最新签发版本（非当前可用证书）→ **409**。
 
+### 证书核验包（馆外接收方）与本地签名密钥轮换
+
+馆员需要向馆外（如借展接收方、合作机构）出示一张证书时，可出具一份
+**可携带、可离线核验的证书核验包**：包是一段自描述 JSON，含证书标识、
+版本、结论、签发时间、不可变快照摘要、密钥标识与签名，接收方提交回本馆
+（或任何持有历史公钥的一方）即可核验，核验过程不依赖证书原记录在线，
+也**不改变任何业务状态**。
+
+**密码学口径（固定，包内自带算法标识）**：
+
+- 签名算法：**Ed25519**（RFC 8032；确定性签名，签名 64 字节，Base64 输出）；
+- 快照摘要：**SHA-256**，对不可变快照做规范化 JSON（键排序、无多余空白、
+  UTF‑8、不转义非 ASCII）后取小写十六进制摘要；
+- **签名覆盖包内除 `signature` 外的全部字段**，出包端与核验端使用同一
+  规范化函数；任一字段（含 `snapshot_digest`、`key_id`）被改动，
+  签名即核验失败。
+
+**出具核验包**：`POST /api/v1/certificates/{id}/verification-package`
+（输入已签发证书标识；证书不存在 → **404**）。响应：
+
+```json
+{
+  "format": "museum-certificate-verification-bundle/v1",
+  "certificate_id": 19,
+  "version": 1,
+  "verdict": "pass",
+  "issued_at": "2026-10-03T09:55:19.931Z",
+  "snapshot_digest": "6baca79452e0a15a58d179c731f2d1fd10f64efc4c55f6402a5927cade6dd65b",
+  "snapshot_digest_algorithm": "SHA-256",
+  "key_id": "key-2026-10-03T09-54-02Z-0e39bb5a8fca3816",
+  "signature_algorithm": "Ed25519",
+  "signature": "OnYJzebrLg7xMghS8DYXIHvA66NZgDGeC6gS5cn3QtFSXIi6xYZtk1kyIm0x/W9zZ0eyJgJb4xwF8D4DGYiSCA=="
+}
+```
+
+- 出具核验包**不修改原证书与不可变快照**；对同一证书重复出包内容
+  （含签名）完全确定——Ed25519 为确定性签名；
+- **已撤销或已被新版本替代的历史证书同样可以出包**：包只如实承载该证
+  签发时内容；它是否仍“当前可用”由核验端单独判定。
+
+**提交核验**：`POST /api/v1/verification-packages/verify`（请求体即核验包；
+额外字段、缺字段 → **422**）。在同一**读事务**内只读取同一已提交状态，
+分别给出三部分结论：
+
+1. `signature_check`：签名是否可信——`key_id` 必须是馆方保留的公钥
+   （当前 `active` 或轮换前 `retired` 的历史公钥），且签名须覆盖除签名
+   外全部字段；`key_status` 标明该密钥当前为 active 还是 retired；
+2. `snapshot_check`：包内 `snapshot_digest` 是否与馆内存根证书的
+   不可变快照 SHA-256 摘要一致（`expected_digest` 给出馆方重算值）；
+3. `certificate` + `current`：该证书是否仍为所属窗口**最新未撤销版本**——
+   - `state=current`：最新签发且未撤销，`is_current=true`，当前可用；
+   - `state=revoked`：已撤销，`not_current_reason` 给出撤销时间与撤销
+     原因；
+   - `state=superseded`：未撤销但已有更新版本，`not_current_reason`
+     给出最新版本号/证书标识；若最新版也已撤销，进一步说明“撤销不
+     自动退回旧版、窗口当前无可用证书”。
+   `package_trusted=true` 只表示包真实承载本馆该证书签发时内容；
+   当 `state` 非 `current` 时中文结论明确提示
+   **“可信历史包不等于当前可用”**。
+
+**明确拒绝（核验只读，均不落任何写）**：
+
+- 字段篡改（包内任一字段与签名不符）→ **422**（签名核验失败）；
+- 未知密钥（`key_id` 不在馆方保留公钥中）→ **422**；
+- 无对应证书（包自洽、签名可信，但馆内查无此证）→ **404**；
+- 快照摘要不符（包内证书标识/版本/结论/签发时间与存根一致，但快照
+  摘要对不上存根快照）→ **422**（指出 `snapshot_digest` 不一致）；
+- 包格式/签名算法/摘要算法不受支持、签名非合法 Base64、缺字段或额外
+  字段 → **422**。
+
+**本地签名密钥轮换**（私钥仅存馆方本地 SQLite 库，不随任何接口输出）：
+
+- 服务**首次启动**（或首次出包）时若库中无 active 密钥则自动生成一把
+  Ed25519 密钥；密钥随库持久化，**服务重启后沿用库内既有密钥**，不重复
+  生成，新旧包核验结果一致；
+- `POST /api/v1/signing-keys/rotate`（body `{"reason":"非空轮换原因"}`）
+  在本地轮换：生成一把新 active 密钥用于此后出具的新包，旧密钥置为
+  `retired` 但**历史公钥保留**（并记录轮换时间与原因）；轮换前出具的
+  旧核验包仍可凭旧公钥核验（`key_status=retired` 但 `trusted=true`）；
+  空原因/空白原因 → **422**；
+- `GET /api/v1/signing-keys` 列出当前 active 与全部保留的 retired 公钥
+  （SPKI PEM，可出示给馆外接收方做离线验签）；**任何接口都不返回私钥**。
+
 ---
 
 ## 2. 启动
@@ -572,6 +663,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `POST` | `/api/v1/cross-window-reviews` | 跨审定窗口连续温度暴露只读复核：按时间排列的至少两张**当前可用证书**（最新签发且未撤销）+ 正数全程连续超限上限；只从各证不可变快照还原半开区段（不用当前读数/规则），跨窗边界两侧均超限连续累计、正常/未知（含故障遮蔽）切断累计；输出逐段状态与来源证书、全程最长连续超限、未知总时长与结论。重复/不足两张/非正上限/顺序错误/窗口不接续/温度范围不一致 422（不出部分结果），证书不存在 404，已撤销或非最新版 409；只读，取同一已提交状态且不改证书/移交单 |
 
+### 证书核验包（馆外接收方）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/certificates/{id}/verification-package` | 对已签发证书出具可携带核验包：证书标识/版本/结论/签发时间/不可变快照 SHA-256 摘要/密钥标识 + Ed25519 签名（覆盖除签名外全部字段）；不改原证书与快照；历史（已撤销/被替代）证书也可出包；证书不存在 404 |
+| `POST` | `/api/v1/verification-packages/verify` | 接收方提交核验包核验（只读，不改业务状态）：分别给出签名可信（active/retired 历史公钥）、快照摘要是否一致、该证书是否仍为所属窗口最新未撤销版本（current/revoked/superseded，非当前可用说明原因，可信历史包不等于当前可用）；字段篡改/未知密钥/摘要不符/格式算法不受支持/缺字段或额外字段 422，无对应证书 404 |
+| `GET` | `/api/v1/signing-keys` | 列出保留的签名密钥（**仅公钥与元数据**：当前 active + 轮换后 retired 历史公钥；私钥不输出），密钥随库持久化、重启后一致 |
+| `POST` | `/api/v1/signing-keys/rotate` | 本地轮换签名密钥（body `{"reason":"非空原因"}`）：新包用新 active 密钥，旧密钥置 retired 但历史公钥保留，旧包仍可核验；空/空白原因 422 |
+
 复核请求与响应：
 
 ```json
@@ -615,6 +715,51 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 > 上限 500s 复核判**不合格**。`segments` 不跨窗合并，故来源证书逐段可查；
 > 跨窗累计仍跨 `source` 边界进行。复核不落任何记录（无复核单号），可随时
 > 凭同一组证书重复调用。
+
+证书核验包请求与响应：
+
+```json
+// 请求：POST /api/v1/certificates/19/verification-package（无请求体）
+// 响应（可携带包；签名覆盖除 signature 外全部字段）
+{
+  "format": "museum-certificate-verification-bundle/v1",
+  "certificate_id": 19,
+  "version": 1,
+  "verdict": "pass",
+  "issued_at": "2026-10-03T09:55:19.931Z",
+  "snapshot_digest": "6baca79452e0a15a58d179c731f2d1fd10f64efc4c55f6402a5927cade6dd65b",
+  "snapshot_digest_algorithm": "SHA-256",
+  "key_id": "key-2026-10-03T09-54-02Z-0e39bb5a8fca3816",
+  "signature_algorithm": "Ed25519",
+  "signature": "OnYJzebrLg7xMghS8DYXIHvA66NZgDGeC6gS5cn3QtFSXIi6xYZtk1kyIm0x/W9y…(Base64)"
+}
+
+// 请求：POST /api/v1/verification-packages/verify（请求体即上面的包）
+// 响应（节选）：签名、快照、当前可用性分别给出
+{
+  "signature_check": {"trusted": true, "key_id": "key-…", "algorithm": "Ed25519", "key_status": "active"},
+  "snapshot_check": {"trusted": true, "digest_algorithm": "SHA-256", "expected_digest": "6baca7…"},
+  "certificate": {
+    "certificate_id": 19, "window_id": 12, "version": 1,
+    "verdict": "pass", "verdict_label_zh": "合格",
+    "revoked": false, "revocation": null,
+    "is_latest_version": true, "is_current": true,
+    "state": "current", "not_current_reason": null
+  },
+  "current": {"is_current": true, "available_now": true,
+              "latest_version": 1, "latest_certificate_id": 19,
+              "window_has_current_certificate": true},
+  "package_trusted": true,
+  "conclusion_zh": "核验结论：签名可信、快照摘要一致；证书 19 为窗口 12 当前最新未撤销版本……，当前可用。"
+}
+```
+
+> `certificate.state` 为 `current` / `revoked` / `superseded`；后两者
+> `not_current_reason` 给出撤销时间与原因、或替代它的最新版本号（最新版也
+> 被撤销时说明撤销不退回旧版）。`package_trusted` 与 `current.is_current`
+> 独立：一个被撤销/被替代证书的核验包仍可“包可信”，但
+> **可信历史包不等于当前可用**。轮换后核验旧包时
+> `signature_check.key_status` 为 `retired` 但 `trusted` 仍为 `true`。
 
 申请放行请求体与响应：
 
@@ -768,7 +913,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   作废或查询修订历史时读数从未存在；
   **仪器故障时段登记时窗口不存在、撤回时窗口不存在或故障标识在该窗口从未登记（未知标识）**；
   **移交单：申请放行时任一窗口不存在；按单号查询时移交单不存在**；
-  **跨窗复核：任一证书不存在**
+  **跨窗复核：任一证书不存在**；
+  **证书核验包：出具核验包时证书不存在；接收方提交的核验包签名可信、字段自洽但馆内无对应证书**
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
   以不高于作废修订号的提交尝试复活读数；
@@ -791,7 +937,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   **移交单：窗口标识列表为空、列表内标识重复、移交单号为空或只含空白**；
   **跨窗复核：证书不足 2 张、证书标识重复、全程上限非正数或非有限值、
   输入未按窗口时间先后排列、窗口不接续（有缝隙或重叠）、各窗口允许
-  温度上下限不一致（响应只含 `detail`，不出具分段/时长等部分结果）**
+  温度上下限不一致（响应只含 `detail`，不出具分段/时长等部分结果）**；
+  **证书核验包：包格式/签名算法/摘要算法不受支持、缺字段或额外字段、
+  签名非合法 Base64、未知密钥（key_id 不在保留公钥中）、字段篡改导致
+  签名核验失败、包内证书标识/版本/结论/签发时间与存根不符、快照摘要
+  与存根不可变快照不符（均只含 `detail`）；本地密钥轮换原因为空或只含
+  空白也返回 422**
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
 > 不会出现“批内前几项已生效、后几项失败”的部分写入。跨窗复核为只读，
@@ -804,10 +955,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核 → 证书核验包出具/核验与本地签名密钥轮换）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核、证书核验包出具/核验（含已撤销/被替代）与本地签名密钥轮换）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -994,6 +1145,33 @@ curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
 # 复核只读：不改证书/读数/规则/故障登记/移交单，可随时凭同一组证书重复调用。
 ```
 
+证书核验包最小示例（承接一张已签发证书 `$CID`）：
+
+```bash
+# 1) 馆员出具核验包（不改原证书与快照；历史证书也可出包）
+curl -sS -X POST http://localhost:8000/api/v1/certificates/$CID/verification-package \
+  | tee /tmp/bundle.json   # 含证书标识/版本/结论/签发时间/快照摘要/密钥标识/Ed25519 签名
+
+# 2) 馆外接收方提交核验：分别给出签名可信、快照可信、是否仍为最新未撤销版本
+curl -sS -X POST http://localhost:8000/api/v1/verification-packages/verify \
+  -H 'Content-Type: application/json' --data @/tmp/bundle.json
+# -> signature_check.trusted / snapshot_check.trusted / certificate.state
+#    （current | revoked | superseded）；非 current 时 not_current_reason
+#    说明撤销原因或替代版本号；package_trusted=true 不等于 current.is_current。
+
+# 3) 本地轮换签名密钥（新包用新密钥；旧密钥置 retired 但历史公钥保留）
+curl -sS -X POST http://localhost:8000/api/v1/signing-keys/rotate \
+  -H 'Content-Type: application/json' -d '{"reason":"年度密钥轮换：2026Q4"}'
+# 轮换前的旧包再次核验仍 trusted（signature_check.key_status=retired）；
+# 空/空白轮换原因 -> 422。
+
+# 4) 查看保留公钥（仅公钥，可出示给接收方离线验签；私钥任何接口都不返回）
+curl -sS http://localhost:8000/api/v1/signing-keys
+
+# 拒绝：字段篡改（签名失败）/未知密钥/快照摘要不符/格式算法不受支持 -> 422；
+#       证书不存在出包、或核验包无对应证书 -> 404。核验只读，不改业务状态。
+```
+
 ---
 
 ## 5. 测试
@@ -1056,18 +1234,27 @@ PYTHONPATH=. python -m pytest tests/ -q
   间隔未知/故障遮蔽未知待定/有未知仍 fail；只读不改证书且只依快照；
   重复标识/不足两张/非正与非有限上限 422、不存在 404、已撤销或非最新版
   409、窗口不接续/温度范围不一致/未按时间排列 422 且拒绝不含部分结果）。
+- `tests/test_verification_package_api.py`：证书核验包与签名密钥轮换
+  HTTP 集成测试（出包字段/确定性签名/原证书与快照不改；核验分别给出
+  签名可信、快照可信、current/revoked/superseded 与非当前可用原因；
+  可信历史包不等于当前可用；字段篡改/未知密钥/无对应证书/快照摘要不符/
+  格式算法不受支持/缺字段或额外字段/非法 Base64 均 422、无对应证书 404；
+  核验只读且重复核验结果一致；本地轮换后新包用新密钥、旧包凭 retired
+  历史公钥仍可信；多次轮换全部历史公钥保留；服务重启后沿用库内密钥、
+  新旧包核验结果一致；已撤销证书也可出包；空轮换原因 422）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表/仪器故障时段表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表/仪器故障时段表/Ed25519 签名密钥表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
   evaluation.py    # 核心审定算法（纯函数；含故障时段并集与遮蔽）
   cross_window.py  # 跨审定窗口连续温度暴露复核（纯函数；从各证不可变快照还原半开区段、接续/温度口径校验、跨边界超限累计与结论）
   report.py        # 修订影响报告（规则前后值、快照比对、故障时段差异、含故障遮蔽的时间线对齐，纯函数）
+  attestation.py   # 证书核验包（Ed25519 出包/核验、SHA-256 快照规范化摘要、签名密钥生成/本地轮换/历史公钥保留）
   models.py        # 结论枚举/常量（含移交单有效状态、仪器故障状态与未知来源）
-  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段、跨窗复核）
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段、跨窗复核、核验包与签名密钥轮换）
   services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、仪器故障时段（登记/撤回）、审定、签发、证书撤销、修订影响报告、移交放行单、跨窗复核（当前可用证书核对）业务逻辑
   main.py          # FastAPI 路由
 examples/

@@ -478,3 +478,86 @@ api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"m
 # 撤销后窗2重签 v2 恢复当前可用；旧版 CC2 仍为已撤销不可用
 api POST "/api/v1/windows/$CW2/certificates/issue" '{"note":"撤销后重签 v2"}' >/dev/null
 api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":500}" || true
+
+echo "== 19. 证书核验包（馆外接收方；可携带、可离线核验；不改原证书与快照）=="
+# 单独建一个窗口并签发证书，演示出包/核验/被替代/撤销/本地密钥轮换
+PW=$(api POST /api/v1/windows '{
+  "name": "展柜P-核验包",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T00:10:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 120
+}')
+PID=$(echo "$PW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for m in 0 1 2 3 4 5 6 7 8 9; do
+  api POST "/api/v1/windows/$PID/readings" \
+    "{\"reading_id\":\"r-0$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+done
+api POST "/api/v1/windows/$PID/readings" '{"reading_id":"r-10","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":20.0}' >/dev/null
+PC1=$(api POST "/api/v1/windows/$PID/certificates/issue" '{"note":"核验包-首签"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 19.1 出具核验包（证书标识/版本/结论/签发时间/快照 SHA-256 摘要/密钥标识/Ed25519 签名）--"
+BUNDLE=$(api POST "/api/v1/certificates/$PC1/verification-package")
+echo "$BUNDLE" | python3 -m json.tool
+
+echo "-- 19.2 接收方提交核验：签名可信、快照可信、为所属窗口最新未撤销版本（当前可用）--"
+api POST /api/v1/verification-packages/verify "$BUNDLE" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('签名可信:',d['signature_check']['trusted'],d['signature_check']['key_status']);print('快照可信:',d['snapshot_check']['trusted']);print('当前可用:',d['current']['is_current'],d['certificate']['state']);print(d['conclusion_zh'])"
+
+echo "-- 19.3 同一证书重复出包内容确定（Ed25519 确定性签名，两次完全一致）--"
+BUNDLE2=$(api POST "/api/v1/certificates/$PC1/verification-package")
+[ "$BUNDLE" = "$BUNDLE2" ] && echo "两次出包完全一致"
+
+echo "-- 19.4 字段篡改 -> 422（签名核验失败）；未知密钥 -> 422 --"
+echo "$BUNDLE" | python3 -c "import sys,json;p=json.load(sys.stdin);p['verdict']='fail';print(json.dumps(p,ensure_ascii=False))" \
+  | { read -r TAMPERED; api POST /api/v1/verification-packages/verify "$TAMPERED"; } || true
+echo "$BUNDLE" | python3 -c "import sys,json;p=json.load(sys.stdin);p['key_id']='key-unknown-0000000000000000';print(json.dumps(p,ensure_ascii=False))" \
+  | { read -r TAMPERED; api POST /api/v1/verification-packages/verify "$TAMPERED"; } || true
+
+echo "-- 19.5 查看签名密钥（仅公钥与元数据；服务重启后沿用库内同一把密钥）--"
+api GET /api/v1/signing-keys \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('active:',d['active']['key_id'],d['active']['algorithm']);print('保留密钥数:',len(d['keys']))"
+
+echo "-- 19.6 本地轮换签名密钥：新包用新密钥，旧包凭保留的历史公钥仍可信（retired）--"
+api POST /api/v1/signing-keys/rotate '{"reason":"年度密钥轮换：2026Q4"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'新 active:',d['active']['key_id']);print('全部密钥状态:',[(k['key_id'][:52],k['status']) for k in d['keys']])"
+echo "旧包（轮换前出具）仍可信："
+api POST /api/v1/verification-packages/verify "$BUNDLE" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('签名可信:',d['signature_check']['trusted'],'密钥状态:',d['signature_check']['key_status'])"
+BUNDLENEW=$(api POST "/api/v1/certificates/$PC1/verification-package")
+echo "新包使用新密钥："
+api POST /api/v1/verification-packages/verify "$BUNDLENEW" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('签名可信:',d['signature_check']['trusted'],'密钥状态:',d['signature_check']['key_status'],'当前可用:',d['current']['is_current'])"
+echo "空轮换原因 -> 422："
+api POST /api/v1/signing-keys/rotate '{"reason":"   "}' || true
+
+echo "-- 19.7 签发 v2：v1 的历史核验包仍可信，但已被新版本替代（superseded，非当前可用）--"
+api POST "/api/v1/windows/$PID/certificates/issue" '{"note":"v2"}' >/dev/null
+api POST /api/v1/verification-packages/verify "$BUNDLE" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);c=d['certificate'];print('包整体可信:',d['package_trusted'],'当前可用:',c['is_current'],c['state']);print(c['not_current_reason'])"
+
+echo "-- 19.8 撤销 v2：v1 仍 superseded（最新版也已撤销，窗口无当前可用证书）--"
+PC2=$(api GET "/api/v1/windows/$PID/certificates" | python3 -c "import sys,json;print(json.load(sys.stdin)[-1]['id'])")
+api POST "/api/v1/certificates/$PC2/revocation" '{"reason":"v2 依据有误"}' >/dev/null
+api POST /api/v1/verification-packages/verify "$BUNDLE" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('state:',d['certificate']['state'],'窗口有当前可用证书:',d['current']['window_has_current_certificate'])"
+
+echo "-- 19.9 已撤销证书也可出包（可信历史包，非当前可用）；出包/核验均不改业务状态 --"
+api POST "/api/v1/certificates/$PC1/verification-package" > /tmp/pkg-v1.json
+BASE_URL="${BASE_URL:-http://localhost:8000}" python3 - <<'PY'
+import json, os, urllib.request
+p = json.load(open("/tmp/pkg-v1.json"))
+req = urllib.request.Request(
+    os.environ["BASE_URL"] + "/api/v1/verification-packages/verify",
+    data=json.dumps(p).encode(), headers={"Content-Type": "application/json"}, method="POST")
+d = json.loads(urllib.request.urlopen(req).read())
+print("v1 核验包: 包可信 =", d["package_trusted"], " state =", d["certificate"]["state"])
+PY
+
+echo "-- 19.10 证书不存在出包 -> 404；包格式不受支持 -> 422（无对应证书核验 -> 404）--"
+api POST /api/v1/certificates/99999/verification-package || true
+echo "$BUNDLE" | python3 -c "import sys,json;p=json.load(sys.stdin);p['format']='bad/format';print(json.dumps(p,ensure_ascii=False))" \
+  | { read -r BADFMT; api POST /api/v1/verification-packages/verify "$BADFMT"; } || true

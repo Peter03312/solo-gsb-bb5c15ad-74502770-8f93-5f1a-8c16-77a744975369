@@ -157,6 +157,22 @@ CREATE TABLE IF NOT EXISTS fault_periods (
 
 CREATE INDEX IF NOT EXISTS idx_fault_periods_window
     ON fault_periods(window_id, status, start_at, end_at);
+
+-- 证书核验包本地签名密钥：Ed25519，私钥仅保存在馆方本地库内。
+-- 任意时刻至多一把 status='active' 密钥用于新包签名；轮换把旧密钥置为
+-- retired（保留历史公钥），旧包仍可凭其公钥核验。服务首次启动或首次
+-- 出具核验包时若无 active 密钥则自动生成一把（重启后沿库继续使用）。
+CREATE TABLE IF NOT EXISTS signing_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id TEXT NOT NULL UNIQUE,            -- 包内 key_id 标识（如 key-2026-10-01T08-00-00Z-<hex>）
+    algorithm TEXT NOT NULL,                  -- 固定 Ed25519
+    public_key_pem TEXT NOT NULL,            -- SPKI PEM（可安全出示给接收方）
+    private_key_pem TEXT NOT NULL,           -- PKCS8 PEM（仅馆方本地签名用）
+    status TEXT NOT NULL DEFAULT 'active',     -- active | retired
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    retired_at TEXT,                           -- 轮换停用时间（仅 retired 行）
+    retired_reason TEXT                       -- 轮换原因（仅 retired 行；留痕）
+);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，

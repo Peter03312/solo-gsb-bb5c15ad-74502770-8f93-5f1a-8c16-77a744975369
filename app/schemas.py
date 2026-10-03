@@ -757,6 +757,133 @@ class ErrorBody(BaseModel):
     detail: str
 
 
+# ------------------------------------------------------------ 证书核验包（馆外接收方）
+
+class VerificationPackage(BaseModel):
+    """馆员出具给馆外接收方的可携带证书核验包。
+
+    字段固定；签名覆盖包内除 `signature` 外的全部字段（出包端按固定顺序
+    规范化 JSON 后用 Ed25519 签名，Base64 输出）：
+
+    - `format`：包格式标识（museum-certificate-verification-bundle/v1）；
+    - `certificate_id`/`version`/`verdict`/`issued_at`：与证书存根一致的
+      证书标识、版本、结论与签发时间；
+    - `snapshot_digest`：证书不可变快照的 SHA-256 十六进制摘要（快照本身
+      不随包携带，接收方据此比对馆内存根快照）；
+    - `key_id`：签名所用密钥标识（active 或轮换后保留的历史公钥）；
+    - `signature`：对上述字段规范化 JSON 的 Ed25519 签名（Base64）。
+    """
+
+    format: str = Field(..., description="核验包格式标识")
+    certificate_id: int = Field(..., ge=1)
+    version: int = Field(..., ge=1)
+    verdict: str = Field(..., description="签发时固化的结论 pass | pending | fail")
+    issued_at: str = Field(..., description="证书签发时间（UTC，与库内存根一致）")
+    snapshot_digest: str = Field(..., min_length=1, description="不可变快照的 SHA-256 十六进制摘要")
+    snapshot_digest_algorithm: str = Field(..., description="摘要算法（固定 SHA-256）")
+    key_id: str = Field(..., min_length=1, description="签名密钥标识（须在馆方保留的历史公钥中）")
+    signature_algorithm: str = Field(..., description="签名算法（固定 Ed25519）")
+    signature: str = Field(..., min_length=1, description="对除 signature 外全部字段的 Ed25519 签名（Base64）")
+
+
+class VerificationPackageSubmit(VerificationPackage):
+    """接收方提交核验的核验包：字段集合必须与出包完全一致（拒绝额外字段）。"""
+
+    model_config = {"extra": "forbid"}
+
+
+class VerificationSignatureCheckOut(BaseModel):
+    trusted: bool = Field(..., description="签名是否可信（公钥在保留密钥中且签名覆盖全部签名字段）")
+    key_id: str
+    algorithm: str = Field(..., description="Ed25519")
+    key_status: str = Field(..., description="active | retired（旧包以 retired 历史公钥核验仍可信）")
+
+
+class VerificationSnapshotCheckOut(BaseModel):
+    trusted: bool = Field(..., description="包内快照摘要是否与馆内存根证书的不可变快照一致")
+    digest_algorithm: str
+    expected_digest: str = Field(..., description="馆方按存根快照重算的 SHA-256 摘要")
+
+
+class VerificationCertificateOut(BaseModel):
+    certificate_id: int
+    window_id: int
+    version: int
+    verdict: str
+    verdict_label_zh: str
+    issued_at: str
+    revoked: bool = Field(..., description="核验时刻该证书是否已撤销")
+    revocation: Optional[RevocationInfoOut] = Field(None, description="撤销信息（原因/时间）；未撤销为 null")
+    is_latest_version: bool = Field(..., description="核验时刻是否为所属窗口最新签发版本")
+    is_current: bool = Field(..., description="是否为所属窗口最新未撤销版本（当前可用）")
+    state: str = Field(..., description="current | revoked | superseded")
+    not_current_reason: Optional[str] = Field(
+        None, description="非当前可用时的明确原因（已撤销/被新版本替代；含撤销原因或最新版本号）")
+
+
+class VerificationCurrentOut(BaseModel):
+    is_current: bool = Field(..., description="该证书是否为所属窗口最新未撤销版本")
+    available_now: bool = Field(..., description="此刻是否可作为窗口当前可用证书（等价于 is_current）")
+    latest_version: Optional[int] = Field(None, description="窗口最新签发版本号（不论是否撤销）")
+    latest_certificate_id: Optional[int] = Field(None, description="窗口最新签发证书标识")
+    window_has_current_certificate: bool = Field(
+        ..., description="该窗口此刻是否存在当前可用证书（撤销最新版不自动退回旧版）")
+
+
+class VerificationResultOut(BaseModel):
+    package: VerificationPackage = Field(..., description="原样回显的核验包")
+    signature_check: VerificationSignatureCheckOut
+    snapshot_check: VerificationSnapshotCheckOut
+    certificate: VerificationCertificateOut = Field(..., description="核验时刻的存根证书状态")
+    current: VerificationCurrentOut
+    package_trusted: bool = Field(
+        ..., description="包整体是否可信（签名可信 + 快照摘要一致 + 证书存在且字段相符）；"
+        "可信历史包不等于当前可用")
+    conclusion_zh: str = Field(..., description="中文核验结论（当前可用 / 已撤销或被替代原因）")
+
+
+class SigningKeyOut(BaseModel):
+    """签名密钥元数据（仅含历史/当前公钥；私钥不输出）。"""
+
+    key_id: str
+    algorithm: str = Field(..., description="Ed25519")
+    status: str = Field(..., description="active | retired")
+    created_at: str
+    retired_at: Optional[str] = Field(None, description="轮换停用时间（仅 retired）")
+    retired_reason: Optional[str] = Field(None, description="轮换原因（仅 retired）")
+    public_key_pem: str = Field(..., description="SPKI PEM 公钥（可出示给馆外接收方）")
+
+
+class KeyRotateSubmit(BaseModel):
+    """本地轮换签名密钥：非空原因（仅用于操作留痕/回显，随旧密钥状态记录）。
+
+    轮换后旧密钥置为 retired 且**公钥保留**，轮换前的旧核验包仍可
+    凭旧公钥核验；新出具的核验包使用新 active 密钥。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="轮换原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("轮换原因不能为空（不能只含空白字符）")
+        return v
+
+
+class KeyRotateResponse(BaseModel):
+    active: SigningKeyOut = Field(..., description="轮换后用于新包的新 active 密钥")
+    keys: list[SigningKeyOut] = Field(
+        ..., description="全部保留密钥（新 active + 历史 retired 公钥；旧包仍可核验）")
+    effect: str = Field("rotated", description="rotated（旧 active 置 retired，保留其历史公钥）")
+
+
+class KeyListResponse(BaseModel):
+    active: Optional[SigningKeyOut] = Field(None, description="当前用于新包签名的 active 密钥；无则为 null")
+    keys: list[SigningKeyOut] = Field(..., description="全部保留签名密钥（含 retired 历史公钥），新→旧")
+
+
 # WindowOut.current_certificate 前向引用了后文定义的 CertificateOut，
 # 全部模型定义完成后重建一次以解析该引用。
 WindowOut.model_rebuild()

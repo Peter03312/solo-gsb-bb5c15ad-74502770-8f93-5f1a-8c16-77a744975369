@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
-from . import services
+from . import attestation, services
 from .database import connect, get_conn, init_db, read_transaction, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
@@ -26,6 +26,9 @@ from .schemas import (
     HandoverOrderSubmit,
     HandoverOrderSubmitResponse,
     IssueRequest,
+    KeyListResponse,
+    KeyRotateResponse,
+    KeyRotateSubmit,
     ReadingBatchSubmit,
     ReadingBatchSubmitResponse,
     ReadingOut,
@@ -38,6 +41,9 @@ from .schemas import (
     RuleRevisionOut,
     RuleRevisionResponse,
     RuleRevisionSubmit,
+    VerificationPackage,
+    VerificationPackageSubmit,
+    VerificationResultOut,
     WindowCreate,
     WindowOut,
 )
@@ -45,10 +51,14 @@ from .schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时幂等建表并初始化 WAL
+    # 启动时幂等建表并初始化 WAL（init_db 内部自行提交 DDL）
     conn = connect()
     try:
         init_db(conn)
+        # 核验包签名密钥：启动即确保有一把 active Ed25519 密钥
+        # （首次启动生成；重启后沿用库中既有密钥，含 retired 历史公钥）
+        with write_transaction(conn):
+            attestation.ensure_active_key(conn)
     finally:
         conn.close()
     yield
@@ -56,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -80,7 +90,14 @@ app = FastAPI(
         "超限连续累计、正常或未知（含故障遮蔽）切断累计，输出逐段状态与来源"
         "证书、全程最长连续超限时长、未知总时长与结论；重复/不存在证书、"
         "已撤销或非最新版证书、窗口不接续、温度范围不一致均明确拒绝且不出"
-        "部分结果，复核取同一已提交状态且不改证书或移交单。"
+        "部分结果，复核取同一已提交状态且不改证书或移交单；"
+        "馆员可向馆外接收方出具证书核验包（含证书标识/版本/结论/签发时间/"
+        "不可变快照摘要/密钥标识与 Ed25519 签名，签名覆盖除签名外全部字段，"
+        "原证书及快照不改），接收方提交后分别得到签名、快照是否可信及该证"
+        "是否仍为所属窗口最新未撤销版本（已撤销或被新版本替代须说明原因，"
+        "可信历史包不等于当前可用）；签名密钥可在本地轮换（新包用新密钥，"
+        "旧包凭保留的历史公钥核验，重启后结果一致），字段篡改、未知密钥、"
+        "无对应证书或快照摘要不符均明确拒绝，核验不改变业务状态。"
     ),
     lifespan=lifespan,
 )
@@ -565,3 +582,107 @@ def get_handover_order(
     # 读事务：多条核对读取看到同一已提交快照，不与并发签发/撤销撕裂
     with read_transaction(conn):
         return services.get_handover_order(conn, handover_no)
+
+
+# ------------------------------------------------------------ 证书核验包（馆外接收方）
+
+@app.post(
+    "/api/v1/certificates/{certificate_id}/verification-package",
+    response_model=VerificationPackage,
+    status_code=status.HTTP_201_CREATED,
+    tags=["verification-packages"],
+)
+def issue_verification_package(
+    certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """馆员向馆外接收方出具一张已签发证书的核验包（可携带、可离线核验）。
+
+    输入已签发证书标识（路径主键），返回含证书标识、版本、结论、签发时间、
+    不可变快照摘要（SHA-256）、密钥标识与签名（Ed25519，Base64）的
+    可携带内容；签名覆盖包内除 `signature` 外的**全部字段**（按固定顺序
+    规范化 JSON）。出包**不修改原证书与不可变快照**；已撤销或已被替代
+    的历史证书同样可以出包——包是否“当前可用”由核验端单独说明。
+
+    - 首次出包（或服务启动）时若本地无 active 签名密钥则自动生成一把；
+    - 证书不存在 -> 404。可对同一证书重复出包（包内容确定，签名确定）。
+    """
+    with write_transaction(conn):
+        return attestation.issue_verification_package(conn, certificate_id)
+
+
+@app.post(
+    "/api/v1/verification-packages/verify",
+    response_model=VerificationResultOut,
+    tags=["verification-packages"],
+)
+def verify_verification_package(
+    payload: VerificationPackageSubmit, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """接收方提交核验包核验（只读；不改变证书、快照、撤销等任何业务状态）。
+
+    分别给出：
+    - 签名是否可信：`key_id` 须为馆方保留（active 或轮换前 retired）的
+      历史公钥，且签名须覆盖包内除签名外全部字段；
+    - 快照是否可信：包内 `snapshot_digest` 须与馆内存根证书不可变
+      快照的 SHA-256 摘要一致；
+    - 该证书是否仍为所属窗口**最新未撤销版本**（当前可用）：已撤销或被
+      新版本替代均在 `certificate.not_current_reason` 说明原因；
+      **可信历史包不等于当前可用**（`package_trusted` 与 `current.is_current`
+      分别给出）。
+
+    明确拒绝（均不落任何写）：
+    - 包格式/算法不受支持、字段缺失或额外字段、签名 Base64 非法 -> 422；
+    - 未知密钥（`key_id` 不在保留公钥中）-> 422；
+    - 签名与包内字段不符（任一字段篡改）-> 422；
+    - 包内证书标识/版本/结论/签发时间与存根不符、快照摘要不符 -> 422；
+    - 包自洽但馆内**无对应证书** -> 404。
+    """
+    with read_transaction(conn):
+        return attestation.verify_verification_package(conn, payload.model_dump())
+
+
+@app.get(
+    "/api/v1/signing-keys",
+    response_model=KeyListResponse,
+    tags=["verification-packages"],
+)
+def list_signing_keys(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """列出馆方保留的核验包签名密钥（**仅公钥与元数据，私钥不输出**）。
+
+    含当前 active 密钥与轮换后保留的全部 retired 历史公钥；接收方可凭
+    此核对包内 `key_id` 对应公钥（离线核验签名）。密钥随库持久化，
+    服务重启后列表与核验结果一致。
+    """
+    with read_transaction(conn):
+        rows = attestation.list_key_rows(conn)
+        active = next((r for r in rows if r["status"] == attestation.KEY_ACTIVE), None)
+        return {
+            "active": attestation.signing_key_to_dict(active) if active is not None else None,
+            "keys": [attestation.signing_key_to_dict(r) for r in rows],
+        }
+
+
+@app.post(
+    "/api/v1/signing-keys/rotate",
+    response_model=KeyRotateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["verification-packages"],
+)
+def rotate_signing_key(
+    payload: KeyRotateSubmit, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """馆员在本地轮换核验包签名密钥（凭非空轮换原因）。
+
+    生成一把新的 active Ed25519 密钥用于此后出具的新包；旧密钥置为
+    retired 但**历史公钥保留**——轮换前出具的旧核验包仍可凭旧公钥
+    核验（`signature_check.key_status=retired` 但仍可信）。密钥全部
+    仅存馆方本地库，随卷持久化，重启后新旧包核验结果一致。
+    原因为空或只含空白 -> 422。
+    """
+    with write_transaction(conn):
+        new_row, rows = attestation.rotate_signing_key(conn, payload.reason)
+        return {
+            "active": attestation.signing_key_to_dict(new_row),
+            "keys": [attestation.signing_key_to_dict(r) for r in rows],
+            "effect": "rotated",
+        }

@@ -34,6 +34,14 @@
      两侧均超限连续累计、正常/未知（含故障遮蔽）切断累计；严格超限
      不合格、有未知待定、其余合格；重复/不存在、已撤销/非最新版、
      窗口不接续、温度范围不一致均拒绝且不出部分结果（只读，不改证书）。
+ 11) 证书核验包（馆外接收方）：输入已签发证书标识出具可携带核验包
+     （证书标识/版本/结论/签发时间/不可变快照 SHA-256 摘要/密钥标识
+     与 Ed25519 签名，签名覆盖除签名外全部字段，原证书与快照不改）；
+     接收方提交后分别得到签名、快照是否可信及该证是否仍为所属窗口最新
+     未撤销版本（已撤销/被新版本替代说明原因，可信历史包不等于当前可用）；
+     字段篡改、未知密钥、无对应证书、快照摘要不符均明确拒绝，核验只读；
+     签名密钥可本地轮换（新包用新密钥，旧包凭保留的历史公钥核验，
+     重启后结果一致）。
 """
 from __future__ import annotations
 
@@ -723,6 +731,22 @@ def cross_window_review(cert_ids, limit):
                  "max_continuous_exceed_seconds": limit})
 
 
+def verification_package(cid):
+    return call("POST", f"/api/v1/certificates/{cid}/verification-package")
+
+
+def verify_package(pkg):
+    return call("POST", "/api/v1/verification-packages/verify", pkg)
+
+
+def rotate_signing_key(reason):
+    return call("POST", "/api/v1/signing-keys/rotate", {"reason": reason})
+
+
+def list_signing_keys():
+    return call("GET", "/api/v1/signing-keys")
+
+
 def create_window_range(name, start_hm, end_hm, *, tmin=18.0, tmax=22.0,
                         max_exceed=300, max_gap=600):
     """按 HH:MM 创建 2026-10-01 当天窗口（用于跨窗复核的相接窗口）。"""
@@ -815,9 +839,98 @@ def cross_window_demo() -> None:
     print("窗口不接续 / 温度范围不一致 422，拒绝响应只含 detail、无任何分段部分结果")
 
 
+def verification_package_demo() -> None:
+    """证书核验包：出包、核验、被替代/撤销、字段篡改、本地密钥轮换。"""
+    show("证书核验包（馆外接收方）：可携带、签名覆盖除签名外全部字段")
+    wid = create_window("展柜P-核验包", 10, max_exceed=300, max_gap=120)
+    for m in range(11):
+        assert submit(wid, f"r-{m:02d}", 1, m, 20.0)[0] == 201
+    cid = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+                {"note": "核验包-首签"})[1]["id"]
+
+    # 出具核验包
+    code, pkg = verification_package(cid)
+    assert code == 201
+    print("核验包字段：", sorted(pkg.keys()))
+    assert len(pkg["snapshot_digest"]) == 64  # SHA-256 hex
+    assert pkg["signature_algorithm"] == "Ed25519"
+    _, pkg_repeat = verification_package(cid)
+    assert pkg == pkg_repeat, "Ed25519 确定性签名：同一证书重复出包一致"
+
+    # 接收方核验：签名可信 + 快照可信 + 当前最新未撤销
+    code, d = verify_package(pkg)
+    assert code == 200, d
+    print("当前证书核验：签名可信", d["signature_check"]["trusted"],
+          "（", d["signature_check"]["key_status"], "）；快照可信",
+          d["snapshot_check"]["trusted"], "；当前可用",
+          d["current"]["is_current"], d["certificate"]["state"])
+    assert d["package_trusted"] and d["current"]["is_current"]
+    print(" ", d["conclusion_zh"])
+
+    # 字段篡改 -> 422（签名覆盖除签名外全部字段）
+    tampered = dict(pkg)
+    tampered["verdict"] = "fail"
+    code, err = verify_package(tampered)
+    assert code == 422 and "签名核验失败" in err["detail"]
+    unknown_key = dict(pkg)
+    unknown_key["key_id"] = "key-unknown-0000000000000000"
+    code, err = verify_package(unknown_key)
+    assert code == 422 and "未知密钥" in err["detail"]
+    print("字段篡改 422（签名核验失败）；未知密钥 422")
+
+    # 不存在证书出包 404；包格式不受支持 422
+    assert verification_package(99999)[0] == 404
+    bad_fmt = dict(pkg)
+    bad_fmt["format"] = "bad/format"
+    assert verify_package(bad_fmt)[0] == 422
+
+    # 本地轮换签名密钥
+    code, rot = rotate_signing_key("年度密钥轮换：2026Q4")
+    assert code == 201 and rot["effect"] == "rotated"
+    old_key = pkg["key_id"]
+    new_key = rot["active"]["key_id"]
+    assert old_key != new_key
+    print("轮换后密钥：新 active", new_key[:48], "…；旧置 retired 但公钥保留")
+
+    # 旧包凭历史公钥仍可信（retired）；新包用新密钥
+    _, d_old = verify_package(pkg)
+    assert d_old["signature_check"]["trusted"] is True
+    assert d_old["signature_check"]["key_status"] == "retired"
+    _, pkg_new = verification_package(cid)
+    assert pkg_new["key_id"] == new_key
+    _, d_new = verify_package(pkg_new)
+    assert d_new["signature_check"]["key_status"] == "active"
+    print("旧包仍可信（retired 历史公钥）；新包用新密钥（active）")
+    assert rotate_signing_key("   ")[0] == 422
+
+    # 签发新版本：旧历史包可信但被替代（superseded），可信历史包不等于当前可用
+    call("POST", f"/api/v1/windows/{wid}/certificates/issue", {"note": "v2"})
+    code, d = verify_package(pkg)
+    c = d["certificate"]
+    print("新版本签发后旧包：包可信", d["package_trusted"], "state =", c["state"])
+    assert code == 200 and d["package_trusted"] is True
+    assert c["is_current"] is False and c["state"] == "superseded"
+    assert "已被更新版本替代" in c["not_current_reason"]
+
+    # 最新版再撤销：旧包仍 superseded，窗口无当前可用证书（撤销不退回旧版）
+    cid2 = call("GET", f"/api/v1/windows/{wid}/certificates")[1][-1]["id"]
+    assert revoke_cert(cid2, "v2 依据有误")[0] == 201
+    _, d = verify_package(pkg)
+    assert d["certificate"]["state"] == "superseded"
+    assert d["current"]["window_has_current_certificate"] is False
+    print("最新版撤销后：旧包仍可信，但窗口无当前可用证书（撤销不退回旧版）")
+
+    # 密钥列表（仅公钥）
+    _, keys = list_signing_keys()
+    print("保留密钥：", [(k["key_id"][-12:], k["status"]) for k in keys["keys"]])
+    assert all("private_key" not in k for k in keys["keys"])
+    print("核验全程只读：证书版本、撤销状态与快照均未因核验而改变")
+
+
 if __name__ == "__main__":
     main()
     fault_period_demo()
     handover_demo()
     cross_window_demo()
+    verification_package_demo()
     print("\n全部示例执行完成 ✔")
